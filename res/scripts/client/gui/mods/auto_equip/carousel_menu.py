@@ -3,8 +3,22 @@
 
   * Demount equipment          - one vehicle, every device that comes off free
   * Demount bounty equipment   - one vehicle, trophy/bounty devices only
+  * Demount improved equipment - one vehicle, Improved (purple) devices only
 
-Garage-wide bounty demount lives on the hangar popover (gameface.py), not here.
+Garage-wide bounty and Improved demounts live on the hangar popover
+(gameface.py), not here.
+
+The Improved entry is 360 China only (issue #42). WG's WoT Plus free-demounts
+regular, trophy and Experimental level 1 devices but NOT Improved ones; the 360
+China Plus subscription does. inventory.improved_demount_is_free() probes the
+client's own IWotPlusController for the answer rather than hardcoding a realm
+list, so on WG the entry is never built at all - a row that could only ever
+report "nothing found" is worse than no row.
+
+Every check goes through inventory.is_free_to_demount() first, which is what
+makes this safe on a realm where Improved demounts cost money: even if the
+gate above ever let a WG client through, the per-device check would still keep
+its purple devices mounted.
 
 That menu is the old Scaleform context menu, not a Gameface view: the client
 builds it from plain dicts in VehicleContextMenuHandler._generateOptions and
@@ -35,6 +49,7 @@ from .log import LOG
 
 _OPTION_ID = 'z4imonDemountFree'
 _OPTION_DEMOUNT_TROPHY = 'z4imonDemountAllTrophy'
+_OPTION_DEMOUNT_IMPROVED = 'z4imonDemountAllImproved'
 
 # One run at a time, and never on top of an apply or cleanup run - all three
 # move the same devices around.
@@ -64,6 +79,28 @@ def _is_trophy(item):
     try:
         return bool(item.isTrophy)
     except Exception:
+        return False
+
+
+def _is_deluxe(item):
+    """Improved (purple) device. isDeluxe is the same flag the client itself
+    uses for them, and what inventory.improved_demount_is_free() probes."""
+    try:
+        return bool(item.isDeluxe)
+    except Exception:
+        return False
+
+
+def improved_demount_available():
+    """Whether this realm demounts Improved devices for free - i.e. whether the
+    Improved rows may exist at all.
+
+    WG: false, so no row is built. 360 China: true (issue #42). Probed through
+    the client's own subscription controller, so no realm list is hardcoded."""
+    try:
+        return inventory.improved_demount_is_free()
+    except Exception:
+        LOG.exc('could not determine whether Improved demounts are free')
         return False
 
 
@@ -100,16 +137,27 @@ def _free_devices(vehicle):
 
 def _trophy_vehicles():
     """Owned tanks that currently carry a free-to-demount trophy device."""
+    return _vehicles_carrying(_is_trophy, 'trophy')
+
+
+def _deluxe_vehicles():
+    """Owned tanks that currently carry a free-to-demount Improved device."""
+    return _vehicles_carrying(_is_deluxe, 'Improved')
+
+
+def _vehicles_carrying(accept, what):
+    """Owned tanks with at least one free-to-demount device passing `accept`,
+    best tier first so the batch visits the tanks most likely to matter."""
     found = []
     for vehicle in inventory.owned_vehicles():
         try:
             if vehicle.isLocked or inventory.is_mode_only_vehicle(vehicle):
                 continue
-            if _matching_devices(vehicle, _is_trophy):
+            if _matching_devices(vehicle, accept):
                 found.append(vehicle)
         except Exception:
-            LOG.exc('could not scan %s for trophy equipment'
-                    % getattr(vehicle, 'userName', '?'))
+            LOG.exc('could not scan %s for %s equipment'
+                    % (getattr(vehicle, 'userName', '?'), what))
     return sorted(found, key=lambda v: (-v.level, v.userName))
 
 
@@ -173,6 +221,26 @@ def _demount_all_trophy_option(handler):
                              {'enabled': enabled})
 
 
+def _demount_all_improved_option(handler):
+    """Improved (purple) strip for the right-clicked vehicle only. Built only
+    where the realm demounts Improved for free - see the module docstring."""
+    if (config.is_mod_disabled()
+            or not config.is_carousel_menu_row_enabled('demountImproved')
+            or not inventory.has_wot_plus()
+            or not improved_demount_available()):
+        return None
+    vehicle = inventory.vehicle_by_inv_id(handler.getVehInvID())
+    if vehicle is None:
+        return None
+    if inventory.is_mode_only_vehicle(vehicle):
+        return None
+    enabled = (not vehicle.isLocked
+               and _runs_idle()
+               and bool(_matching_devices(vehicle, _is_deluxe)))
+    return handler._makeItem(_OPTION_DEMOUNT_IMPROVED, _cm_label('cmDemountImproved'),
+                             {'enabled': enabled})
+
+
 # ---------------------------------------------------------------------------
 # Hooks
 # ---------------------------------------------------------------------------
@@ -184,7 +252,8 @@ _original_on_option_select = VehicleContextMenuHandler.onOptionSelect
 def _hooked_generate_options(self, ctx=None):
     options = _original_generate_options(self, ctx)
     extras = []
-    for builder in (_demount_option, _demount_all_trophy_option):
+    for builder in (_demount_option, _demount_all_trophy_option,
+                    _demount_all_improved_option):
         try:
             item = builder(self)
             if item is not None:
@@ -209,6 +278,12 @@ def _hooked_on_option_select(self, optionId):
             demount_trophy_equipment(self.getVehInvID())
         except Exception:
             LOG.exc('bounty demount from the carousel menu failed')
+        return
+    if optionId == _OPTION_DEMOUNT_IMPROVED:
+        try:
+            demount_improved_equipment(self.getVehInvID())
+        except Exception:
+            LOG.exc('Improved demount from the carousel menu failed')
         return
     return _original_on_option_select(self, optionId)
 
@@ -279,39 +354,68 @@ def demount_free_equipment(veh_inv_id):
         apply_engine.notify_refresh()
 
 
+@adisp_async
 @adisp_process
-def demount_trophy_equipment(veh_inv_id):
+def demount_trophy_equipment(veh_inv_id, callback=None):
     """Takes free-to-demount trophy/bounty devices off ONE vehicle."""
+    try:
+        yield _demount_one_vehicle(veh_inv_id, _is_trophy, 'demountBounty',
+                                   'bounty', 'demountAllTrophyWaiting')
+    finally:
+        if callback is not None:
+            callback(None)
+
+
+@adisp_async
+@adisp_process
+def demount_improved_equipment(veh_inv_id, callback=None):
+    """Takes free-to-demount Improved (purple) devices off ONE vehicle.
+
+    360 China only; demount_all_improved() is the garage-wide twin. On WG this
+    is never reachable because no row is built, but the per-device
+    free-to-demount check would still hold if it were."""
+    try:
+        yield _demount_one_vehicle(veh_inv_id, _is_deluxe, 'demountImproved',
+                                   'Improved', 'demountAllImprovedWaiting')
+    finally:
+        if callback is not None:
+            callback(None)
+
+
+def _demount_one_vehicle(veh_inv_id, accept, toggle, what, waiting_key):
+    """Shared body of the two single-vehicle batch demounts: one guard sequence,
+    one veil, one report."""
     global _busy, _busy_text
-    if not config.is_carousel_menu_row_enabled('demountBounty'):
-        LOG.info('carousel bounty demount: feature toggle off, ignoring')
+    if not config.is_carousel_menu_row_enabled(toggle):
+        LOG.info('carousel %s demount: feature toggle off, ignoring' % what)
         return
     if _busy or _other_run_busy():
-        LOG.info('carousel bounty demount: another run is busy, ignoring')
+        LOG.info('carousel %s demount: another run is busy, ignoring' % what)
         return
     vehicle = inventory.vehicle_by_inv_id(veh_inv_id)
     if vehicle is None:
         return
     if vehicle.isLocked:
-        LOG.warning('carousel bounty demount: %s is locked, aborting' % veh_inv_id)
+        LOG.warning('carousel %s demount: %s is locked, aborting'
+                    % (what, veh_inv_id))
         return
     if inventory.is_mode_only_vehicle(vehicle):
-        LOG.warning('carousel bounty demount: %s is a mode-only loaner, aborting'
-                    % vehicle.userName)
+        LOG.warning('carousel %s demount: %s is a mode-only loaner, aborting'
+                    % (what, vehicle.userName))
         return
 
     _busy = True
-    _busy_text = t('demountAllTrophyWaiting')
+    _busy_text = t(waiting_key)
     removed = 0
     veil_shown = messages.show_waiting(messages.WAITING_KEY_OPERATION,
                                        _busy_text)
     try:
-        LOG.info('carousel bounty demount: start for %s' % vehicle.userName)
-        removed = yield _demount_vehicle(veh_inv_id, _is_trophy)
-        LOG.info('carousel bounty demount: done for %s, %d device(s) removed'
-                 % (vehicle.userName, removed))
+        LOG.info('carousel %s demount: start for %s' % (what, vehicle.userName))
+        removed = yield _demount_vehicle(veh_inv_id, accept)
+        LOG.info('carousel %s demount: done for %s, %d device(s) removed'
+                 % (what, vehicle.userName, removed))
     except Exception:
-        LOG.exc('demount_trophy_equipment failed')
+        LOG.exc('demount_%s_equipment failed' % what)
     finally:
         _busy = False
         if veil_shown:
@@ -321,48 +425,85 @@ def demount_trophy_equipment(veh_inv_id):
         apply_engine.notify_refresh()
 
 
+@adisp_async
 @adisp_process
-def demount_all_trophy():
+def demount_all_trophy(callback=None):
     """Takes every free-to-demount trophy/bounty device off every eligible
     tank and leaves standard, Improved and Experimental devices mounted."""
+    try:
+        yield _demount_all_vehicles(_trophy_vehicles, _is_trophy, 'demountBounty',
+                                    'bounty', 'demountAllTrophyWaiting',
+                                    'demountAllTrophyNothing',
+                                    'demountAllTrophyDone')
+    finally:
+        if callback is not None:
+            callback(None)
+
+
+@adisp_async
+@adisp_process
+def demount_all_improved(callback=None):
+    """Takes every free-to-demount Improved (purple) device off every eligible
+    tank and leaves standard, bounty and Experimental devices mounted.
+
+    The mirror image of demount_all_trophy, for the 360 China realm where Plus
+    demounts Improved equipment for free (issue #42): the player pulls all
+    their purple devices back into the depot, turns auto-install off, and then
+    hands them out deliberately to the tanks that should get them."""
+    try:
+        if not improved_demount_available():
+            LOG.info('Improved demount: this realm does not demount them for free')
+            messages.push_warning(t('demountAllImprovedUnsupported'))
+            return
+        yield _demount_all_vehicles(_deluxe_vehicles, _is_deluxe, 'demountImproved',
+                                    'Improved', 'demountAllImprovedWaiting',
+                                    'demountAllImprovedNothing',
+                                    'demountAllImprovedDone')
+    finally:
+        if callback is not None:
+            callback(None)
+
+
+def _demount_all_vehicles(collect, accept, toggle, what, waiting_key,
+                          nothing_key, done_key):
+    """Shared body of the two garage-wide demounts."""
     global _busy, _busy_text
-    if not config.is_icon_menu_row_enabled('demountBounty'):
-        LOG.info('carousel trophy demount: feature toggle off, ignoring')
+    if not config.is_icon_menu_row_enabled(toggle):
+        LOG.info('carousel %s demount: feature toggle off, ignoring' % what)
         return
     if _busy or _other_run_busy():
-        LOG.info('carousel trophy demount: another run is busy, ignoring')
+        LOG.info('carousel %s demount: another run is busy, ignoring' % what)
         return
 
-    found = _trophy_vehicles()
+    found = collect()
     if not found:
-        messages.push_warning(t('demountAllTrophyNothing'))
+        messages.push_warning(t(nothing_key))
         return
 
     _busy = True
-    _busy_text = t('demountAllTrophyWaiting')
+    _busy_text = t(waiting_key)
     removed = 0
     vehicles_touched = 0
     veil_shown = messages.show_waiting(messages.WAITING_KEY_OPERATION,
                                        _busy_text)
     try:
-        LOG.info('carousel trophy demount: start, %d vehicle(s): %s'
-                 % (len(found), [vehicle.userName for vehicle in found]))
+        LOG.info('carousel %s demount: start, %d vehicle(s): %s'
+                 % (what, len(found), [vehicle.userName for vehicle in found]))
         for vehicle in found:
-            count = yield _demount_vehicle(vehicle.invID, _is_trophy)
+            count = yield _demount_vehicle(vehicle.invID, accept)
             if count:
                 vehicles_touched += 1
             removed += count
-        LOG.info('carousel trophy demount: done, %d device(s) off %d vehicle(s)'
-                 % (removed, vehicles_touched))
-        messages.push_info(t('demountAllTrophyDone',
-                             count=removed, vehicles=vehicles_touched),
+        LOG.info('carousel %s demount: done, %d device(s) off %d vehicle(s)'
+                 % (what, removed, vehicles_touched))
+        messages.push_info(t(done_key, count=removed, vehicles=vehicles_touched),
                            priority=NotificationPriorityLevel.HIGH)
-        # Auto-install would put the saved trophy sets straight back on the
-        # next vehicle click. Same protection as the Primary batch run.
+        # Auto-install would put the saved sets straight back on the next
+        # vehicle click. Same protection as the Primary batch run.
         if removed:
             apply_engine.disable_auto_install_after_batch()
     except Exception:
-        LOG.exc('demount_all_trophy failed')
+        LOG.exc('demount_all_%s failed' % what)
     finally:
         _busy = False
         if veil_shown:
